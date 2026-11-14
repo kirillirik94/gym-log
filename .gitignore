@@ -1,0 +1,10 @@
+# Личное и служебное — не публикуется
+SPEC.md
+PROMPT.md
+PROGRESS.md
+dev/fixtures/
+.claude/
+.DS_Store
+*.local.*
+# Тесты на личных данных программы — только локально
+dev/test.mjs

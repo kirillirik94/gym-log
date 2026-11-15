@@ -34,8 +34,14 @@ export function suggestNextDay(history, days = ['A', 'B']) {
 
 export function exerciseFromTemplate(pe, prevEntry) {
   let sets;
+  // Разминку задаёт программа (start_sets с «w»), рабочие подходы — прошлый раз.
+  const progWarm = (pe.startSets || []).filter((s) => s.warmup);
   if (prevEntry && prevEntry.sets.length) {
-    sets = prevEntry.sets.map((s) => newSet(s.weight, s.reps, s.warmup));
+    const prevSets = progWarm.length ? prevEntry.sets.filter((s) => !s.warmup) : prevEntry.sets;
+    sets = [
+      ...progWarm.map((s) => newSet(s.weight, s.reps, true)),
+      ...prevSets.map((s) => newSet(s.weight, s.reps, s.warmup)),
+    ];
   } else if (pe.startSets && pe.startSets.length) {
     sets = pe.startSets.map((s) => newSet(s.weight, s.reps, s.warmup));
   } else {

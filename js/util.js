@@ -1,6 +1,6 @@
 // Общие утилиты без DOM — их можно гонять в Node.
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.0.1';
 
 export function uuid() {
   if (globalThis.crypto && crypto.randomUUID) return crypto.randomUUID();

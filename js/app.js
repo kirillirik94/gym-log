@@ -793,7 +793,13 @@ const ACTIONS = {
   'go': (d) => go(d.to),
   'open-active': () => go('workout'),
   'start': (d) => startWorkout(d.day),
-  'toggle-done': (d) => mutate(() => { const { s } = setsOf(d); s.done = !s.done; s.doneAt = s.done ? Date.now() : null; }),
+  // Отметка подхода сразу (пере)запускает таймер отдыха этого упражнения.
+  'toggle-done': (d) => mutate((w) => {
+    const { e, s } = setsOf(d);
+    s.done = !s.done;
+    s.doneAt = s.done ? Date.now() : null;
+    if (s.done && e.restSec > 0) w.rest = { endsAt: s.doneAt + e.restSec * 1000, duration: e.restSec * 1000 };
+  }),
   'step': (d) => mutate(() => {
     const { e, s } = setsOf(d);
     const dir = Number(d.dir);

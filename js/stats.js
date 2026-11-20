@@ -267,3 +267,116 @@ export function pickFact(cands, shown = [], rnd = Math.random) {
   const pool = fresh.length ? fresh : cands;
   return pool[Math.floor(rnd() * pool.length)] || null;
 }
+
+/* ---------- Экран «Прогресс» ---------- */
+
+const doneWork = (e) => (e && !e.skipped ? e.sets.filter((s) => s.done && !s.warmup) : []);
+const entryOf = (w, id) => w.exercises.find((e) => e.exerciseId === id);
+
+/** Основной день упражнения: первый день программы, где оно есть (A раньше B). Лёгкий день не мешает сравнению. */
+export function mainDayOf(program, id) {
+  return Object.keys(program.days).sort().find((d) => program.days[d].some((p) => p.exerciseId === id)) || null;
+}
+
+/** Значение для графика: e1RM, у упражнений со своим весом — сумма повторов. */
+export function exerciseValue(sets, ex) {
+  if (!sets.length) return null;
+  if (ex?.type === 'bodyweight') return sets.reduce((a, s) => a + s.reps, 0);
+  return clean(Math.max(...sets.map((s) => e1rm(s.weight, s.reps))));
+}
+
+/** Тренировки с упражнением в основной день → [{w, sets, value, top, pr}] по времени. */
+export function exerciseSeries(workouts, program, id) {
+  const ex = program.exercises[id];
+  const day = mainDayOf(program, id);
+  const out = [];
+  let best = -Infinity;
+  for (const w of workouts) {
+    if (day && w.day !== day) continue;
+    const sets = doneWork(entryOf(w, id));
+    if (!sets.length) continue;
+    const value = exerciseValue(sets, ex);
+    const pr = out.length > 0 && value > best + 0.01;
+    best = Math.max(best, value);
+    out.push({ w, sets, value, top: Math.max(...sets.map((s) => s.weight)), pr });
+  }
+  return out;
+}
+
+/**
+ * Статус двойной прогрессии для экрана «Прогресс».
+ * kind: new | skipped | <kind из progressionHint>; плюс сколько повторов осталось до прибавки.
+ */
+export function progressStatus(workouts, program, id, weightStep, hintFn, sessionsFn) {
+  const ex = program.exercises[id];
+  const day = mainDayOf(program, id);
+  const pe = program.days[day]?.find((p) => p.exerciseId === id);
+  if (!ex || !pe) return { kind: 'new' };
+  const dayWs = workouts.filter((w) => w.day === day);
+  let skipped = 0;
+  for (let i = dayWs.length - 1; i >= 0; i--) { if (doneWork(entryOf(dayWs[i], id)).length) break; skipped++; }
+  const any = dayWs.some((w) => doneWork(entryOf(w, id)).length);
+  if (!any) return dayWs.length ? { kind: 'skipped', n: skipped } : { kind: 'new' };
+  if (skipped >= 2) return { kind: 'skipped', n: skipped };
+
+  const sessions = sessionsFn(id, day, workouts, program.days[day]);
+  const hint = hintFn(pe, ex, sessions, weightStep);
+  const sets = sessions[0].sets;
+  const top = Math.max(...sets.map((s) => s.weight));
+  const atTop = sets.filter((s) => s.weight === top).slice(0, pe.sets);
+  const need = pe.sets * pe.repMax;
+  const done = atTop.reduce((a, s) => a + Math.min(s.reps, pe.repMax), 0);
+  return {
+    kind: hint.kind, params: hint.params,
+    step: ex.progressStep || weightStep || 2.5,
+    top, reps: atTop.map((s) => s.reps), sets: pe.sets, repMin: pe.repMin, repMax: pe.repMax,
+    below: atTop.filter((s) => s.reps < pe.repMin).length,
+    repsLeft: Math.max(0, need - done), pct: Math.min(1, done / need),
+  };
+}
+
+/**
+ * Средний отдых: время между отметками соседних подходов одного упражнения или одного суперсета.
+ * Паузы длиннее 20 минут не считаем. → [{key, ids, day, avgSec, planSec, n}]
+ */
+export function restStats(workouts) {
+  const acc = new Map();
+  for (const w of workouts) {
+    const marks = [];
+    for (const e of w.exercises) {
+      if (e.skipped) continue;
+      const key = e.superset ? `${w.day}:${e.superset}` : e.exerciseId;
+      for (const s of e.sets) if (s.done && s.doneAt) marks.push({ at: s.doneAt, key, id: e.exerciseId, plan: e.restSec || 0 });
+    }
+    marks.sort((a, b) => a.at - b.at);
+    for (let i = 1; i < marks.length; i++) {
+      const m = marks[i], p = marks[i - 1];
+      if (m.key !== p.key) continue;
+      const sec = (m.at - p.at) / 1000;
+      if (sec <= 0 || sec > 20 * 60) continue;
+      if (!acc.has(m.key)) acc.set(m.key, { key: m.key, ids: [], day: w.day, sum: 0, n: 0, planSum: 0 });
+      const a = acc.get(m.key);
+      if (!a.ids.includes(p.id)) a.ids.push(p.id);
+      if (!a.ids.includes(m.id)) a.ids.push(m.id);
+      a.sum += sec; a.planSum += m.plan; a.n++;
+    }
+  }
+  return [...acc.values()].map((a) => ({ key: a.key, ids: a.ids, day: a.day, n: a.n, avgSec: Math.round(a.sum / a.n), planSec: Math.round(a.planSum / a.n) }));
+}
+
+/** Рабочие подходы по группам мышц (поле muscle_group листа Exercises). */
+export function muscleSets(workouts, program) {
+  const out = {};
+  for (const w of workouts) for (const e of w.exercises) {
+    const n = doneWork(e).length;
+    if (!n) continue;
+    const g = program.exercises[e.exerciseId]?.group || 'other';
+    out[g] = (out[g] || 0) + n;
+  }
+  return out;
+}
+
+/** Упражнения программы, которые не сделаны (пропущены или без единого подхода). */
+export function missedExercises(w) {
+  return w.exercises.filter((e) => !e.adhoc && !doneWork(e).length).map((e) => e.exerciseId);
+}

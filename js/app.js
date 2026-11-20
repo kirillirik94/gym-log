@@ -5,9 +5,10 @@ import { createWorkout, suggestNextDay, newSet, adhocExercise, elapsedMs, unchec
 import { previousSessions, progressionHint, lastSetsText } from './progression.js';
 import {
   computeSummary, workoutXp, levelFromXp, weeklyStreak, computeAchievements, ACHIEVEMENTS, factCandidates, pickFact, e1rm,
+  progressStatus, exerciseSeries, mainDayOf, restStats, muscleSets, missedExercises, strengthLevel, STANDARDS, LEVELS,
 } from './stats.js';
 import { api, enqueue, processQueue } from './sync.js';
-import { lineChart, barChart } from './charts.js';
+import { lineChart, barChart, sparkline } from './charts.js';
 import { esc, fmtNum, fmtDuration, clean, toNum, ymd, weekKey, addDays, APP_VERSION } from './util.js';
 
 /* =========================================================
@@ -23,7 +24,7 @@ const S = {
   bodyweight: [],
   queue: [],
   active: null,
-  ui: { historyTab: 'calendar', calOffset: 0, chartEx: 'bench_press', pickerQuery: '' },
+  ui: { historyTab: 'calendar', calOffset: 0, chartEx: 'bench_press', chartTip: null, period: '3m', pickerQuery: '' },
   modal: null,
   syncError: null,
 };
@@ -441,7 +442,7 @@ function viewHistory() {
   const seg = `<div class="seg">${tabs.map((k) => `<button class="${tab === k ? 'on' : ''}" data-a="htab" data-tab="${k}">${esc(t(k))}</button>`).join('')}</div>`;
   let body = '';
   if (tab === 'calendar') body = viewCalendar();
-  else if (tab === 'charts') body = viewCharts();
+  else if (tab === 'charts') body = viewProgress();
   else if (tab === 'workouts') body = viewWorkoutList();
   else body = viewAchievements();
   return `<h1>${esc(t('history'))}</h1>${levelCard()}<div style="margin-top:12px">${seg}</div><div style="margin-top:12px">${body}</div>`;
@@ -474,44 +475,266 @@ function viewCalendar() {
     <div class="cal">${cells}</div></div>`;
 }
 
-function viewCharts() {
-  const lang = getLang();
-  const used = new Set();
-  for (const w of S.workouts) for (const e of w.exercises) if (!e.skipped) used.add(e.exerciseId);
-  for (const d of Object.values(S.program.days)) for (const p of d) used.add(p.exerciseId);
-  const ids = [...used].filter((id) => exDef(id));
+/* ---------- Прогресс ---------- */
+
+const DAY_MS = 86400000;
+const PERIOD_DAYS = { '4w': 28, '3m': 91, all: Infinity };
+const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, '0')}`;
+const dNum = (ts) => fmtDate(ts, { day: 'numeric', month: 'numeric' });
+
+/** Упражнения программы по дням; общее для A и B показываем в первом дне. */
+function progressDays() {
+  const seen = new Set();
+  return Object.keys(S.program.days).sort().map((d) => ({
+    day: d,
+    ids: S.program.days[d].map((p) => p.exerciseId).filter((id) => exDef(id) && !seen.has(id) && seen.add(id)),
+  })).filter((x) => x.ids.length);
+}
+
+function statusOf(id) {
+  const ex = exDef(id);
+  return progressStatus(S.workouts, S.program, id, weightStepFor(ex, S.settings), progressionHint, previousSessions);
+}
+
+/** → {cls, chip, title, note} для статуса прогрессии. */
+function statusView(st, ex) {
+  const bw = ex.type === 'bodyweight';
+  const p = { step: st.step, n: st.n, left: st.repsLeft, below: st.below, of: st.reps?.length };
+  const chip = {
+    new: ['', t('ps_new')], skipped: ['warn', t('ps_skipped', p)],
+    up: ['up', t('ps_up', p)], up_bw: ['up', t('ps_up_bw', p)],
+    reps: ['hint', t('ps_reps', p)], reps_bw: ['hint', t('ps_reps_bw', p)],
+    stay: ['danger', t('ps_stay', p)], reduce: ['danger', t('ps_reduce')], back_rollback: ['danger', t('ps_back')],
+    need_back_ok: ['warn', t('ps_need_back')], no_failure_repeat: ['warn', t('ps_no_failure')],
+  }[st.kind] || ['', ''];
+  let title = chip[1], note = '';
+  if (st.kind === 'new') note = t('ps_new_note');
+  else if (st.kind === 'skipped') note = t('ps_skipped_note');
+  else {
+    const hp = { ...st.params };
+    if (st.kind === 'back_rollback') hp.to = hp.to ? `: ~${fmt(hp.to)} ${t('kg')}` : '';
+    title = t(`hint_${st.kind}`, hp);
+    const gp = { sets: st.sets, max: st.repMax, reps: st.reps.join(' / ') };
+    note = bw && st.top <= 0 ? t('pc_goal_bw', gp) : t('pc_goal', { ...gp, w: bw ? `+${kg(st.top)}` : kg(st.top) });
+    if (st.repsLeft > 0) note += ' ' + t('pc_left', { n: st.repsLeft });
+  }
+  return { cls: chip[0], chip: chip[1], title, note };
+}
+
+function viewProgress() {
+  const now = Date.now();
+  const days = PERIOD_DAYS[S.ui.period] ?? PERIOD_DAYS['3m'];
+  const from = Number.isFinite(days) ? now - days * DAY_MS : -Infinity;
+  const ws = S.workouts.filter((w) => w.startedAt >= from);
+  const ids = progressDays().flatMap((d) => d.ids);
   if (!ids.includes(S.ui.chartEx)) S.ui.chartEx = ids[0];
+  const prev = Number.isFinite(days) ? S.workouts.filter((w) => w.startedAt >= from - days * DAY_MS && w.startedAt < from) : [];
+  const seg = `<div class="pill">${['4w', '3m', 'all'].map((k) =>
+    `<button class="${S.ui.period === k ? 'on' : ''}" data-a="pperiod" data-v="${k}">${esc(t(`period_${k}`))}</button>`).join('')}</div>`;
+  if (!S.workouts.length) return `${seg}<p class="muted">${esc(t('no_workouts'))}</p>`;
+  return seg + progOverview(ws, prev, now) + progList(ws) + progCard(ws) + progStrength() + progRecovery(ws) + progBody(from) + progMuscles(now);
+}
+
+function progOverview(ws, prev, now) {
+  const vol = ws.reduce((a, w) => a + (w.summary?.volumeWork || 0), 0);
+  const pvol = prev.reduce((a, w) => a + (w.summary?.volumeWork || 0), 0);
+  const prs = ws.reduce((a, w) => a + (w.summary?.prs.length || 0), 0);
+  const st = weeklyStreak(S.workouts, S.settings.target, now);
+  const avgDur = ws.length ? Math.round(ws.reduce((a, w) => a + (w.durationMs || 0), 0) / ws.length / 60000) : 0;
+  const dv = pvol ? Math.round(((vol - pvol) / pvol) * 100) : null;
+  const weeks = [];
+  for (let i = 11; i >= 0; i--) weeks.push(weekKey(addDays(now, -7 * i)));
+  const wv = Object.fromEntries(weeks.map((k) => [k, 0]));
+  for (const w of S.workouts) { const k = weekKey(w.startedAt); if (k in wv) wv[k] += (w.summary?.volumeWork || 0) / 1000; }
+  const weekBars = weeks.map((k) => ({ label: `${Number(k.slice(8))}.${k.slice(5, 7)}`, y: clean(wv[k]) }));
+  return `<h2>${esc(t('ov_title'))}</h2><div class="stats">
+    <div class="stat"><div class="v">${ws.length}</div><div class="l">${esc(t('ov_workouts'))}</div><div class="sub">${esc(t('week_progress', { n: st.thisWeek, target: st.target }))}</div></div>
+    <div class="stat"><div class="v">${fmt(vol / 1000, 1)} <small>т</small></div><div class="l">${esc(t('ov_volume'))}</div>
+      <div class="sub">${dv === null ? esc(t('ov_no_prev')) : `<span class="${dv >= 0 ? 'delta-up' : 'delta-down'}">${dv >= 0 ? '↑' : '↓'} ${Math.abs(dv)}%</span> ${esc(t('ov_vs_prev'))}`}</div></div>
+    <div class="stat"><div class="v">${prs}</div><div class="l">${esc(t('ov_prs'))}</div><div class="sub">${esc(t('ov_prs_sub'))}</div></div>
+    <div class="stat"><div class="v">${st.streak}</div><div class="l">${esc(t('ov_streak', { target: st.target }))}</div><div class="sub">${esc(t('ov_avg_dur', { n: avgDur }))}</div></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>${esc(t('chart_week_volume'))}</h3><div class="chart">${barChart(weekBars)}</div></div>`;
+}
+
+function progList(ws) {
+  const lang = getLang();
+  const rows = progressDays().map(({ day, ids }) => `<div class="day-h">${esc(t('day_other', { d: day }))}</div>` + ids.map((id) => {
+    const ex = exDef(id);
+    const bw = ex.type === 'bodyweight';
+    const ser = exerciseSeries(ws, S.program, id);
+    const sv = statusView(statusOf(id), ex);
+    let val = '<span class="muted">—</span>';
+    if (ser.length) {
+      const a = ser[0].value, b = ser.at(-1).value, d = b - a, rel = a ? d / a : 0;
+      const arrow = ser.length < 2 ? '' : rel > 0.01 ? `<small class="delta-up">↑ ${fmt(d, 1)}</small>`
+        : rel < -0.01 ? `<small class="delta-down">↓ ${fmt(-d, 1)}</small>` : '<small class="muted">→ 0</small>';
+      val = `${fmt(b, 0)} ${esc(bw ? t('reps') : t('kg'))}${arrow}`;
+    }
+    return `<div class="ex-row ${S.ui.chartEx === id ? 'on' : ''} ${ser.length || sv.cls === 'warn' ? '' : 'empty'}" data-a="pex" data-id="${esc(id)}">
+      <div><div class="nm">${esc(exName(ex, lang))}</div>${sv.chip ? `<div class="st"><span class="chip ${sv.cls}">${esc(sv.chip)}</span></div>` : ''}</div>
+      <div class="spark">${sparkline(ser.map((x) => x.value))}</div><div class="val">${val}</div></div>`;
+  }).join('')).join('');
+  return `<h2>${esc(t('ex_title'))}<span class="sub">${esc(t('ex_sub'))}</span></h2><div class="card">${rows}</div>`;
+}
+
+function progCard(ws) {
+  const lang = getLang();
   const id = S.ui.chartEx;
   const ex = exDef(id);
-  const wPts = [], ePts = [];
-  for (const w of S.workouts) {
-    const e = w.exercises.find((x) => x.exerciseId === id && !x.skipped);
-    if (!e) continue;
-    const ws = e.sets.filter((s) => s.done && !s.warmup);
-    if (!ws.length) continue;
-    wPts.push({ x: w.startedAt, y: Math.max(...ws.map((s) => s.weight)) });
-    if (ex.type !== 'bodyweight') ePts.push({ x: w.startedAt, y: clean(Math.max(...ws.map((s) => e1rm(s.weight, s.reps)))) });
+  if (!ex) return '';
+  const bw = ex.type === 'bodyweight';
+  const day = mainDayOf(S.program, id);
+  const pe = S.program.days[day].find((p) => p.exerciseId === id);
+  const sv = statusView(statusOf(id), ex);
+  const st = statusOf(id);
+  const head = `<div class="card-h"><h3>${esc(exName(ex, lang))}</h3><span class="muted small">${pe.sets}×${pe.repMin}–${pe.repMax} · ${esc(t('pc_rest', { t: mmss(pe.restSec) }))}</span></div>`;
+  const box = `<div class="progress-box ${sv.cls || 'hint'}"><b>${esc(sv.title)}</b><div class="small">${esc(sv.note)}</div>${st.pct ? `<div class="pbar"><div style="width:${Math.round(st.pct * 100)}%"></div></div>` : ''}</div>`;
+  const ser = exerciseSeries(ws, S.program, id);
+  if (!ser.length) return `<h2>${esc(t('pc_title'))}</h2><div class="card">${head}${box}<p class="muted small" style="margin:0">${esc(t('no_data'))}</p></div>`;
+
+  const unit = bw ? t('reps') : t('kg');
+  let best = null;
+  for (const x of ser) for (const s of x.sets) {
+    const k = bw ? s.weight * 100 + s.reps : e1rm(s.weight, s.reps);
+    if (!best || k > best.k) best = { k, s, t: x.w.startedAt };
   }
-  const xl = (ts) => fmtDate(ts);
-  const exChart = wPts.length
-    ? `<div class="chart">${lineChart([{ cls: 's1', points: wPts }, { cls: 's2', points: ePts }], xl)}</div>
-       <div class="legend"><span><i style="background:var(--chart-1)"></i>${esc(t('chart_weight'))}${ex.type === 'bodyweight' ? ' (+кг)' : ''}</span>${ePts.length ? `<span><i style="background:var(--chart-2)"></i>${esc(t('chart_e1rm'))}</span>` : ''}</div>`
-    : `<p class="muted">${esc(t('no_data'))}</p>`;
+  const setTxt = (s) => (bw ? (s.weight > 0 ? `+${fmt(s.weight)}×${s.reps}` : `${s.reps}`) : `${fmt(s.weight)}×${s.reps}`);
+  const delta = ser.at(-1).value - ser[0].value;
+  const kpis = `<div class="kpis">
+    <div class="kpi"><div class="v">${fmt(ser.at(-1).value, 0)} ${esc(unit)}</div><div class="l">${esc(t(bw ? 'pc_reps_now' : 'pc_e1rm_now'))}</div></div>
+    <div class="kpi"><div class="v">${esc(setTxt(best.s))}</div><div class="l">${esc(t('pc_best', { d: fmtDate(best.t) }))}</div></div>
+    <div class="kpi"><div class="v ${delta > 0 ? 'delta-up' : delta < 0 ? 'delta-down' : ''}">${ser.length < 2 ? '—' : `${delta > 0 ? '+' : delta < 0 ? '−' : '±'}${fmt(Math.abs(delta), 1)}`}</div><div class="l">${esc(t('pc_delta', { u: unit }))}</div></div></div>`;
 
-  const weeks = [];
-  for (let i = 11; i >= 0; i--) weeks.push(weekKey(addDays(Date.now(), -7 * i)));
-  const wv = Object.fromEntries(weeks.map((k) => [k, 0]));
-  for (const w of S.workouts) { const k = weekKey(w.startedAt); if (k in wv) wv[k] += w.summary.volumeWork / 1000; }
-  const weekBars = weeks.map((k) => ({ label: k.slice(8) + '.' + k.slice(5, 7), y: clean(wv[k]) }));
-  const perW = S.workouts.slice(-20).map((w) => ({ label: fmtDate(w.startedAt, { day: 'numeric' }), y: clean(w.summary.volumeWork / 1000) }));
-  const bwPts = S.bodyweight.map((b) => ({ x: b.date, y: b.kg }));
+  const main = ser.map((x, i) => ({ x: x.w.startedAt, y: x.value, i, pr: x.pr }));
+  const series = bw ? [{ cls: 's1', main: true, points: main }]
+    : [{ cls: 's1', main: true, points: main }, { cls: 's2', points: ser.map((x, i) => ({ x: x.w.startedAt, y: x.top, i })) }];
+  const sel = S.ui.chartTip != null && S.ui.chartTip < ser.length ? S.ui.chartTip : ser.length - 1;
+  const sw = ser[sel].w;
+  const entry = sw.exercises.find((e) => e.exerciseId === id);
+  const allSets = entry.sets.filter((s) => s.done).map((s) => (s.warmup ? `<span class="muted">${esc(setTxt(s))} ${esc(t('warm_s'))}</span>` : esc(setTxt(s)))).join(' · ');
+  const r = sw.ratings || {};
+  const tip = `<div class="tip"><b>${esc(fmtDate(sw.startedAt, { weekday: 'short', day: 'numeric', month: 'short' }))}</b> · ${esc(t('day_other', { d: sw.day }))} · ${bw ? `${ser[sel].value} ${esc(t('reps'))}` : `e1RM ${esc(kg(ser[sel].value))}`}<br>${allSets}
+    <span class="muted">${r.sleep ? ' · ' + esc(t('tip_sleep', { n: r.sleep })) : ''}${r.backOk === true ? ' · ' + esc(t('back_ok_s')) : r.backOk === false ? ' · ' + esc(t('back_bad_s')) : ''}</span></div>`;
+  const chart = `<div class="chart">${lineChart(series, (x) => fmtDate(x), { sel, tapAction: 'ptip' })}</div>
+    <div class="legend"><span><i style="background:var(--chart-1)"></i>${esc(bw ? t('pc_reps_sum') : t('chart_e1rm'))}</span>${bw ? '' : `<span><i style="background:var(--chart-2)"></i>${esc(t('chart_weight'))}</span>`}<span><b class="star">●</b>${esc(t('pc_pr'))}</span></div>
+    <p class="muted small" style="margin:6px 0 0">${esc(t('pc_tap'))}</p>${tip}`;
 
-  return `<div class="card"><label class="field"><span>${esc(t('chart_exercise'))}</span>
-      <select class="sel" data-in="chartEx">${ids.map((i) => `<option value="${esc(i)}" ${i === id ? 'selected' : ''}>${esc(exName(exDef(i), lang))}</option>`).join('')}</select></label>
-      <div style="margin-top:10px">${exChart}</div></div>
-    <div class="card"><h3>${esc(t('chart_week_volume'))}</h3><div class="chart">${S.workouts.length ? barChart(weekBars) : `<p class="muted">${esc(t('no_data'))}</p>`}</div></div>
-    <div class="card"><h3>${esc(t('chart_workout_volume'))}</h3><div class="chart">${perW.length ? barChart(perW) : `<p class="muted">${esc(t('no_data'))}</p>`}</div></div>
-    <div class="card"><h3>${esc(t('chart_bodyweight'))}</h3><div class="chart">${bwPts.length ? lineChart([{ cls: 's1', points: bwPts }], xl) : `<p class="muted">${esc(t('no_data'))}</p>`}</div></div>`;
+  const cols = ser.slice(-6);
+  const nRows = Math.max(...cols.map((x) => x.sets.length));
+  const mode = (arr) => { const c = {}; for (const v of arr) c[v] = (c[v] || 0) + 1; return Number(Object.entries(c).sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0]); };
+  let g = `<div class="sets-grid" style="grid-template-columns: 22px repeat(${cols.length}, minmax(34px, 1fr))"><div></div>`;
+  for (const x of cols) { const mw = mode(x.sets.map((s) => s.weight)); g += `<div class="hd"><b>${esc(dNum(x.w.startedAt))}</b>${bw ? (mw ? '+' + fmt(mw) : esc(t('bw'))) : fmt(mw)}</div>`; }
+  for (let i = 0; i < nRows; i++) {
+    g += `<div class="rl">${i + 1}</div>`;
+    for (const x of cols) {
+      const s = x.sets[i];
+      if (!s) { g += '<div class="cell none"></div>'; continue; }
+      const en = x.w.exercises.find((e) => e.exerciseId === id);
+      const lo = en?.repMin ?? pe.repMin, hi = en?.repMax ?? pe.repMax;
+      const mw = mode(x.sets.map((q) => q.weight));
+      g += `<div class="cell ${s.reps < lo ? 'lo' : s.reps >= hi ? 'hi' : 'mid'}">${s.reps}${s.weight !== mw ? `<small>${bw ? '+' : ''}${fmt(s.weight)}</small>` : ''}</div>`;
+    }
+  }
+  g += '</div>';
+  const grid = `<h3 style="margin-top:16px">${esc(t('pc_sets'))}</h3><p class="muted small" style="margin:2px 0 0">${esc(t('pc_sets_hint'))}</p>${g}
+    <div class="legend"><span><i class="sw lo"></i>${esc(t('pc_lo', { n: pe.repMin }))}</span><span><i class="sw mid"></i>${esc(t('pc_mid'))}</span><span><i class="sw hi"></i>${esc(t('pc_hi', { n: pe.repMax }))}</span></div>`;
+  return `<h2>${esc(t('pc_title'))}<span class="sub">${esc(t('pc_sub'))}</span></h2><div class="card">${head}${kpis}${box}${chart}${grid}</div>`;
+}
+
+function progStrength() {
+  const lang = getLang();
+  const id = STANDARDS[S.ui.chartEx] ? S.ui.chartEx : 'bench_press';
+  const ex = exDef(id);
+  if (!ex) return '';
+  const note = S.ui.chartEx === 'smith_squat' ? `<p class="muted small" style="margin:8px 0 0">${esc(t('st_smith'))}</p>` : '';
+  const ser = exerciseSeries(S.workouts, S.program, id);
+  const head = `<h2>${esc(t('st_title'))}</h2>`;
+  if (!ser.length) return `${head}<div class="card"><p class="muted small" style="margin:0">${esc(exName(ex, lang))}: ${esc(t('no_data'))}</p>${note}</div>`;
+  const last = ser.at(-1);
+  const bwk = last.w.summary?.bw || S.bodyweight.at(-1)?.kg;
+  if (!bwk) return `${head}<div class="card"><p class="muted small" style="margin:0">${esc(t('st_need_bw'))}</p>${note}</div>`;
+  const lvl = strengthLevel(id, last.value, bwk);
+  const st = STANDARDS[id];
+  const maxR = st[3] * 1.3;
+  const edges = [0, ...st, maxR];
+  const colors = ['var(--surface-2)', 'var(--hint-soft)', 'var(--done-soft)', 'var(--warm-soft)', 'var(--danger-soft)'];
+  const segs = edges.slice(0, -1).map((a, i) => `<div style="flex:${edges[i + 1] - a};background:${colors[i]}"></div>`).join('');
+  const lbls = edges.slice(0, -1).map((a, i) => `<span style="flex:${edges[i + 1] - a}">${i ? esc(t(`lvl_short_${LEVELS[i - 1]}`)) : ''}</span>`).join('');
+  const pos = Math.min(98, Math.max(2, (lvl.ratio / maxR) * 100));
+  const name = lvl.level ? t(`lvl_${lvl.level}`) : t('st_below');
+  return `${head}<div class="card">
+    <div class="card-h"><h3>${esc(exName(ex, lang))}</h3><span class="muted small">${esc(t('st_ratio'))}</span></div>
+    <div class="lvl-wrap"><div class="lvl-mark" style="left:${pos}%">${fmt(lvl.ratio, 2)}×</div><div class="lvl">${segs}</div><div class="lvl-lbl">${lbls}</div></div>
+    <p style="margin:10px 0 0"><b>${esc(name[0].toUpperCase() + name.slice(1))}</b> · ${esc(t('st_line', { e: fmt(last.value, 1), bw: fmt(bwk, 1) }))}
+    ${lvl.next ? esc(t('st_next', { lvl: t(`lvl_${lvl.next.level}`), kg: fmt(lvl.next.needKg, 1) })) : ''}</p>
+    <p class="muted small" style="margin:6px 0 0">${esc(t('st_note'))}</p>${note}</div>`;
+}
+
+function progRecovery(ws) {
+  if (!ws.length) return '';
+  const lang = getLang();
+  const rest = restStats(ws);
+  const maxS = Math.max(1, ...rest.map((r) => Math.max(r.avgSec, r.planSec))) * 1.1;
+  const restRows = rest.map((r) => {
+    const over = r.planSec ? r.avgSec / r.planSec : 1;
+    const col = over > 1.5 ? 'var(--danger)' : over > 1.15 ? 'var(--warn)' : 'var(--done)';
+    return `<div class="rest-row"><div class="row"><span class="spacer">${esc(r.ids.map((x) => exName(exDef(x), lang)).join(' ⇄ '))}</span><b style="color:${col}">${mmss(r.avgSec)}</b>
+      ${r.planSec ? `<span class="muted small">${esc(t('rec_plan', { t: mmss(r.planSec) }))}</span>` : ''}</div>
+      <div class="rest-track"><div class="fill" style="width:${(r.avgSec / maxS) * 100}%;background:${col}"></div>${r.planSec ? `<div class="plan" style="left:${(r.planSec / maxS) * 100}%"></div>` : ''}</div></div>`;
+  }).join('');
+
+  const durBars = ws.slice(-12).map((w) => ({ label: dNum(w.startedAt), y: Math.round((w.durationMs || 0) / 60000), warn: (w.durationMs || 0) > 80 * 60000 }));
+  const sc = (v, max) => (v == null ? '<span class="muted">—</span>' : `<span class="sc ${v / max >= 0.75 ? 'g' : v / max >= 0.5 ? 'm' : 'b'}">${v}</span>`);
+  const missed = {};
+  const rows = ws.slice(-8).reverse().map((w) => {
+    const r = w.ratings || {};
+    const plan = w.exercises.filter((e) => !e.adhoc).length;
+    const miss = missedExercises(w);
+    return `<tr><td><b>${esc(fmtDate(w.startedAt))}</b> <span class="muted">${esc(w.day)}</span></td><td>${sc(r.sleep, 5)}</td><td>${sc(r.food, 3)}</td><td>${sc(r.mood, 5)}</td>
+      <td>${r.backOk === true ? '<span class="delta-up">✓</span>' : r.backOk === false ? '<span class="delta-down">✗</span>' : '<span class="muted">—</span>'}</td>
+      <td><span class="sc ${miss.length ? 'm' : 'g'}">${plan - miss.length}/${plan}</span></td></tr>`;
+  }).join('');
+  for (const w of ws) for (const id of missedExercises(w)) missed[id] = (missed[id] || 0) + 1;
+  const missTxt = Object.entries(missed).sort((a, b) => b[1] - a[1]).map(([id, n]) => t('rec_missed_n', { name: exName(exDef(id), lang), n })).join(', ');
+
+  return `<h2>${esc(t('rec_title'))}</h2>
+    ${rest.length ? `<div class="card"><div class="card-h"><h3>${esc(t('rec_rest'))}</h3><span class="muted small">${esc(t('rec_rest_sub'))}</span></div>${restRows}
+      <p class="muted small" style="margin:8px 0 0">${esc(t('rec_rest_note'))}</p></div>` : ''}
+    <div class="card"><div class="card-h"><h3>${esc(t('rec_dur'))}</h3><span class="muted small">${esc(t('rec_dur_sub'))}</span></div><div class="chart">${barChart(durBars, (v) => String(v))}</div></div>
+    <div class="card"><div class="card-h"><h3>${esc(t('rec_well'))}</h3></div>
+      <table class="well"><tr><th></th><th>${esc(t('th_sleep'))}</th><th>${esc(t('th_food'))}</th><th>${esc(t('th_mood'))}</th><th>${esc(t('th_back'))}</th><th>${esc(t('th_ex'))}</th></tr>${rows}</table>
+      ${missTxt ? `<p class="small" style="margin:10px 0 0"><span class="chip warn">${esc(t('rec_missed'))}</span> ${esc(missTxt)}</p>` : ''}</div>`;
+}
+
+function progBody(from) {
+  const b = S.bodyweight.filter((x) => x.date >= from);
+  const head = `<h2>${esc(t('bw_title'))}</h2>`;
+  if (!b.length) return `${head}<div class="card"><p class="muted small" style="margin:0">${esc(t('bw_none'))}</p></div>`;
+  const pts = b.map((x, i) => ({ x: x.date, y: x.kg, i }));
+  const ma = b.length >= 3 ? b.map((x) => {
+    const win = b.filter((y) => y.date <= x.date && y.date > x.date - 7 * DAY_MS);
+    return { x: x.date, y: win.reduce((a, y) => a + y.kg, 0) / win.length };
+  }) : [];
+  const d = b.at(-1).kg - b[0].kg;
+  return `${head}<div class="card">
+    <div class="kpis two"><div class="kpi"><div class="v">${esc(kg(b.at(-1).kg))}</div><div class="l">${esc(t('bw_last', { d: fmtDate(b.at(-1).date) }))}</div></div>
+    <div class="kpi"><div class="v ${d < 0 ? 'delta-up' : d > 0 ? 'delta-down' : ''}">${d > 0 ? '+' : d < 0 ? '−' : '±'}${esc(kg(Math.abs(d)))}</div><div class="l">${esc(t('bw_delta'))}</div></div></div>
+    <div class="chart">${lineChart([{ cls: 's1', points: pts }, ...(ma.length ? [{ cls: 'ma', points: ma, dots: false }] : [])], (x) => fmtDate(x))}</div>
+    <div class="legend"><span><i style="background:var(--chart-1)"></i>${esc(t('bw_points'))}</span><span>${ma.length ? `<i style="background:var(--chart-2)"></i>${esc(t('bw_ma'))}` : esc(t('bw_ma_wait'))}</span></div></div>`;
+}
+
+function progMuscles(now) {
+  const cnt = muscleSets(S.workouts.filter((w) => w.startedAt > now - 7 * DAY_MS), S.program);
+  const groups = [...new Set([...Object.values(S.program.days).flat().map((p) => exDef(p.exerciseId)?.group).filter(Boolean), ...Object.keys(cnt)])];
+  const max = Math.max(22, ...Object.values(cnt));
+  const rows = groups.map((g) => {
+    const n = cnt[g] || 0;
+    return `<div class="mg-row"><span>${esc(t(`mg_${g}`) === `mg_${g}` ? g : t(`mg_${g}`))}</span>
+      <div class="mg-track"><div class="band" style="left:${(10 / max) * 100}%;width:${(10 / max) * 100}%"></div><div class="fill" style="width:${(n / max) * 100}%"></div></div><span class="n">${n}</span></div>`;
+  }).join('');
+  return `<h2>${esc(t('mg_title'))}</h2><div class="card"><div class="card-h"><h3>${esc(t('mg_sub'))}</h3></div>${rows}
+    <p class="muted small" style="margin:8px 0 0">${esc(t('mg_note'))}</p></div>`;
 }
 
 function viewWorkoutList() {
@@ -846,6 +1069,9 @@ const ACTIONS = {
   },
   'htab': (d) => { S.ui.historyTab = d.tab; render(); },
   'cal': (d) => { S.ui.calOffset += Number(d.d); render(); },
+  'pperiod': (d) => { S.ui.period = d.v; S.ui.chartTip = null; render(); },
+  'pex': (d) => { S.ui.chartEx = d.id; S.ui.chartTip = null; render(); },
+  'ptip': (d) => { S.ui.chartTip = Number(d.i); render(); },
   'lang': (d) => { S.settings.lang = d.v; setLang(d.v); saveSettings(); render(); },
   'target': (d) => { S.settings.target = Number(d.v); saveSettings(); render(); },
   'wstep': (d) => { S.settings.weightSteps = { ...S.settings.weightSteps, [d.id]: Number(d.v) }; saveSettings(); render(); },
@@ -914,7 +1140,6 @@ document.addEventListener('input', (ev) => {
 document.addEventListener('change', (ev) => {
   const el = ev.target.closest('[data-in]');
   if (!el) return;
-  if (el.dataset.in === 'chartEx') { S.ui.chartEx = el.value; render(); }
   if (el.dataset.in === 'import' && el.files[0]) importBackup(el.files[0]);
   if (el.dataset.in === 'scriptUrl' || el.dataset.in === 'secret') { saveSettings(); render(); }
 });

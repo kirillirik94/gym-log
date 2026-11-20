@@ -1,5 +1,5 @@
 // Офлайн-кэш всех ресурсов приложения. При изменении файлов поднимай VERSION.
-const VERSION = 'gymlog-v1.0.9';
+const VERSION = 'gymlog-v1.1.0';
 const ASSETS = [
   './',
   './index.html',
